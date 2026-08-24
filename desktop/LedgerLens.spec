@@ -5,6 +5,9 @@ import sys
 
 block_cipher = None
 
+# Absolute paths so the spec works regardless of the invocation cwd.
+ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
+
 hidden = [
     "backend.app",
     "uvicorn.logging",
@@ -22,12 +25,12 @@ hidden = [
 ]
 
 a = Analysis(
-    [os.path.join("..", "desktop", "launcher.py")],
-    pathex=[os.path.join("..")],
+    [os.path.join(ROOT, "desktop", "launcher.py")],
+    pathex=[ROOT],
     binaries=[],
     datas=[
-        (os.path.join("..", "ui"), "ui"),
-        (os.path.join("..", "models", "hf"), "models" + os.sep + "hf"),
+        (os.path.join(ROOT, "ui"), "ui"),
+        (os.path.join(ROOT, "models", "hf"), "models" + os.sep + "hf"),
     ],
     hiddenimports=hidden,
     hookspath=[],
