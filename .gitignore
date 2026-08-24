@@ -1,5 +1,6 @@
 sample/
 samples/
+models/
 __pycache__/
 *.pyc
 out.json

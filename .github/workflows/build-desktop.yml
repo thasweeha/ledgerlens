@@ -1,0 +1,66 @@
+name: Build Desktop Apps
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: LedgerLens-macOS
+          - os: windows-latest
+            artifact: LedgerLens-Windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Pre-download TrOCR model for offline bundling
+        env:
+          HF_HOME: ${{ github.workspace }}/models/hf
+        run: |
+          python -c "from huggingface_hub import snapshot_download; snapshot_download('microsoft/trocr-small-printed'); print('model cached')"
+
+      - name: Build with PyInstaller
+        run: pyinstaller desktop/LedgerLens.spec --noconfirm
+
+      - name: Zip app (macOS)
+        if: runner.os == 'macOS'
+        run: >
+          cd dist &&
+          ditto -c -k --sequesterRsrc --keepParent LedgerLens.app ../${{ matrix.artifact }}.zip
+
+      - name: Zip app (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/LedgerLens -DestinationPath ${{ matrix.artifact }}.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          retention-days: 30
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}.zip
