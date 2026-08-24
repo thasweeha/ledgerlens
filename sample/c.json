@@ -1,0 +1,19 @@
+{
+  "opening_balance": 0.0,
+  "closing_balance": 0.0,
+  "currency": "USD",
+  "account_number": null,
+  "statement_period": null,
+  "transactions": [],
+  "reconciliation": {
+    "reconciled": true,
+    "opening_balance": 0.0,
+    "closing_balance": 0.0,
+    "total_credits": 0.0,
+    "total_debits": 0.0,
+    "calculated_closing": 0.0,
+    "difference": 0.0,
+    "transaction_count": 0,
+    "tolerance": 0.01
+  }
+}

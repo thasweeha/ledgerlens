@@ -1,0 +1,72 @@
+{
+  "opening_balance": 0.0,
+  "closing_balance": 8100.16,
+  "currency": "USD",
+  "account_number": null,
+  "statement_period": null,
+  "transactions": [
+    {
+      "id": null,
+      "date": "2025.08.31",
+      "description": "2025.08.31",
+      "amount": 2025.08,
+      "type": "credit",
+      "balance": null,
+      "page": 1,
+      "bbox": null,
+      "date_bbox": null,
+      "desc_bbox": null,
+      "amount_bbox": null
+    },
+    {
+      "id": null,
+      "date": "2025.08.31",
+      "description": "STATEMENT PERIOD ENDING 2025.08.31",
+      "amount": 2025.08,
+      "type": "credit",
+      "balance": null,
+      "page": 6,
+      "bbox": null,
+      "date_bbox": null,
+      "desc_bbox": null,
+      "amount_bbox": null
+    },
+    {
+      "id": null,
+      "date": "2025-08-06",
+      "description": "2025-08-06",
+      "amount": 2025.0,
+      "type": "credit",
+      "balance": null,
+      "page": 6,
+      "bbox": null,
+      "date_bbox": null,
+      "desc_bbox": null,
+      "amount_bbox": null
+    },
+    {
+      "id": null,
+      "date": "2025-08-06",
+      "description": "2025-08-06",
+      "amount": 2025.0,
+      "type": "credit",
+      "balance": null,
+      "page": 6,
+      "bbox": null,
+      "date_bbox": null,
+      "desc_bbox": null,
+      "amount_bbox": null
+    }
+  ],
+  "reconciliation": {
+    "reconciled": true,
+    "opening_balance": 0.0,
+    "closing_balance": 8100.16,
+    "total_credits": 8100.16,
+    "total_debits": 0.0,
+    "calculated_closing": 8100.16,
+    "difference": 0.0,
+    "transaction_count": 4,
+    "tolerance": 0.01
+  }
+}

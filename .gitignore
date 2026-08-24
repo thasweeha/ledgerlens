@@ -1,0 +1,12 @@
+samples/
+__pycache__/
+*.pyc
+out.json
+out.xlsx
+.venv/
+venv/
+.env
+.DS_Store
+.pytest_cache/
+*.egg-info/
+
