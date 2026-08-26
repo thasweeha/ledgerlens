@@ -93,19 +93,33 @@ def process_statement(
                 pages_tokens[page_index] = result.pop("tokens")
                 raster_diagnostics[page_index] = result
 
-                # ← NEW: Extract checks from this raster page
-                page = doc[page_index]
+                print(f"[ledgerlens] page {page_index + 1}/{total_pages} done", flush=True)
+
+            # Check detection runs for every page type: whether a check image
+            # is present has nothing to do with how the text was extracted.
+            # Pages with no embedded raster at all cannot carry a check image,
+            # so they are skipped before paying for the OCR model load.
+            page = doc[page_index]
+            if page.get_image_info():
+                if ocr is None:
+                    print("[ledgerlens] loading OCR model ...", flush=True)
+                    ocr = _load_ocr(model_path)
                 render_dpi = dpi or 200
                 pix = page.get_pixmap(dpi=render_dpi)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 import numpy as np
                 page_rgb = np.array(img)
-                page_checks = detect_checks(page_rgb, page_index, ocr)
+                # A region that yielded neither an amount nor a check number is
+                # not a check -- it is the empty fallback band.  Dropping it
+                # keeps the log honest now that every page gets scanned.
+                page_checks = [
+                    c
+                    for c in detect_checks(page_rgb, page_index, ocr)
+                    if c.get("amount") is not None or c.get("check_number")
+                ]
                 if page_checks:
                     all_checks.extend(page_checks)
                     print(f"[ledgerlens] page {page_index + 1}: found {len(page_checks)} check(s)", flush=True)
-
-                print(f"[ledgerlens] page {page_index + 1}/{total_pages} done", flush=True)
     finally:
         doc.close()
 
