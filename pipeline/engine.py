@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import pymupdf as fitz
+from PIL import Image
 
+from pipeline.check_ocr import detect_checks
+from pipeline.check_matcher import match_checks_to_transactions
 from pipeline.classifier import classify_statement
 from pipeline.columns import parse_rows
 from pipeline.digital import extract_page_tokens as extract_digital_tokens
@@ -30,10 +33,10 @@ from service.schemas import CellProvenance, StatementPayload
 ENGINE_VERSION = "ledgerlens-unified-2.0"
 
 
-def _load_ocr(model_name: str | None = None):
-    from pipeline.ocr_trocr import DEFAULT_MODEL, TrOCRRecognizer
+def _load_ocr(model_dir: str | None = None):
+    from pipeline.ocr_easyocr import EasyOCRRecognizer
 
-    return TrOCRRecognizer(model_name or DEFAULT_MODEL)
+    return EasyOCRRecognizer(model_dir=model_dir)
 
 
 def _cell_provenance(cell: dict, file_name: str) -> CellProvenance:
@@ -66,6 +69,7 @@ def process_statement(
     file_name = path.name
     pages_tokens: Dict[int, list] = {}
     raster_diagnostics: Dict[int, dict] = {}
+    all_checks: List[dict] = []  # ← NEW: collect checks from raster pages
     ocr = None
 
     doc = fitz.open(path)
@@ -88,19 +92,51 @@ def process_statement(
                 result = extract_raster_tokens(path, page_index, ocr, dpi=dpi)
                 pages_tokens[page_index] = result.pop("tokens")
                 raster_diagnostics[page_index] = result
+
+                # ← NEW: Extract checks from this raster page
+                page = doc[page_index]
+                render_dpi = dpi or 200
+                pix = page.get_pixmap(dpi=render_dpi)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                import numpy as np
+                page_rgb = np.array(img)
+                page_checks = detect_checks(page_rgb, page_index, ocr)
+                if page_checks:
+                    all_checks.extend(page_checks)
+                    print(f"[ledgerlens] page {page_index + 1}: found {len(page_checks)} check(s)", flush=True)
+
                 print(f"[ledgerlens] page {page_index + 1}/{total_pages} done", flush=True)
     finally:
         doc.close()
 
     classification = classify_statement(pages_tokens)
     parsed = parse_rows(pages_tokens)
+
+    # ← NEW: Match extracted checks to transaction rows
+    rows = parsed["transactions"]
+    if all_checks:
+        # Add type field expected by check_matcher
+        for row in rows:
+            amt = row.get("amount")
+            if row.get("is_balance_forward"):
+                row["type"] = "checkpoint"
+            elif amt is not None and amt < 0:
+                row["type"] = "debit"
+            elif amt is not None and amt > 0:
+                row["type"] = "credit"
+            else:
+                row["type"] = "unknown"
+
+        rows = match_checks_to_transactions(all_checks, rows)
+        parsed["transactions"] = rows
+
     summary = extract_statement_summary(pages_tokens)
 
-    rows = parsed["transactions"]
+    rows = parsed["transactions"]  # Use the check-matched rows
     checkpoints = extract_continuity_checkpoints(rows)
     entries: List[LedgerEntry] = [
         LedgerEntry(
-            date=row.get("date", ""),
+            date=row.get("date", "") or "",
             description=row.get("description", ""),
             amount=row.get("amount"),
             balance=row.get("balance"),
@@ -148,7 +184,7 @@ def process_statement(
             {
                 "index": index,
                 "page": int(row.get("page") or 0),
-                "date": row.get("date", ""),
+                "date": row.get("date", "") or "",
                 "post_date": row.get("post_date"),
                 "description": row.get("description", ""),
                 "check_number": row.get("check_number"),

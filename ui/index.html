@@ -7,7 +7,7 @@
   <link rel="icon" href="/favicon.ico?v=3" sizes="any">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=3">
   <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=3">
-  <link rel="stylesheet" href="/css/style.css?v=4">
+  <link rel="stylesheet" href="/css/style.css?v=5">
 </head>
 <body>
   <div class="app-container">
@@ -196,7 +196,7 @@
             </div>
           </div>
 
-          <!-- Re-OCR Floating Action Popover -->
+          <!-- Snip Extraction Preview Panel -->
           <div class="ocr-popover" id="ocrPopover" style="display: none;">
             <div class="popover-header">
               <div class="popover-title">
@@ -204,20 +204,25 @@
                   <path d="M6 2v14a2 2 0 0 0 2 2h14"></path>
                   <path d="M18 22V8a2 2 0 0 0-2-2H2"></path>
                 </svg>
-                <span>Re-OCR Result</span>
+                <span>Snip Preview</span>
               </div>
               <button class="popover-close" id="ocrPopoverClose">&times;</button>
             </div>
             <div class="popover-body">
               <div class="ocr-loading" id="ocrLoading" style="display: none;">
                 <div class="spinner"></div>
-                <span>Scanning 300 DPI pixels...</span>
+                <span id="snipLoadingText">Extracting region...</span>
               </div>
               <div class="ocr-content" id="ocrContent">
                 <div class="ocr-field-row">
                   <label>Extracted Text:</label>
                   <input type="text" id="ocrExtractedText" class="input-cell" spellcheck="false">
                 </div>
+                <div class="snip-chips-row">
+                  <span class="chip conf-chip conf-unknown" id="snipConfidenceChip">Confidence —</span>
+                  <span class="chip source-chip" id="snipSourceChip">—</span>
+                </div>
+                <div class="snip-status-row" id="snipStatusRow"></div>
                 <div class="ocr-field-grid">
                   <div class="ocr-field-item">
                     <label>Parsed Date:</label>
@@ -228,13 +233,12 @@
                     <span class="badge badge-field" id="ocrParsedAmount">—</span>
                   </div>
                 </div>
+                <div class="snip-target-line" id="snipTargetLine"></div>
               </div>
             </div>
             <div class="popover-actions">
-              <button class="btn btn-sm btn-secondary" id="ocrSetDateBtn" title="Set Date of active row">Set Date</button>
-              <button class="btn btn-sm btn-secondary" id="ocrSetDescBtn" title="Set Description of active row">Set Desc</button>
-              <button class="btn btn-sm btn-secondary" id="ocrSetAmtBtn" title="Set Amount of active row">Set Amount</button>
-              <button class="btn btn-sm btn-primary" id="ocrInsertRowBtn" title="Create new transaction row from this OCR">+ New Row</button>
+              <button class="btn btn-sm btn-secondary" id="snipCancelBtn">Cancel</button>
+              <button class="btn btn-sm btn-primary" id="snipApplyBtn" title="Write extracted values into the target row">Apply</button>
             </div>
           </div>
         </div>
@@ -377,7 +381,7 @@
   </div>
 
   <!-- APPLICATION SCRIPTS (PURE LOCAL VANILLA JS) -->
-  <script src="/js/viewer.js?v=4"></script>
-  <script src="/js/editor.js?v=4"></script>
+  <script src="/js/viewer.js?v=5"></script>
+  <script src="/js/editor.js?v=5"></script>
 </body>
 </html>

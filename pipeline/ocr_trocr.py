@@ -9,13 +9,40 @@ raster pipeline stays recognizer-agnostic:
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
+
+# Force HuggingFace offline mode BEFORE any transformers/huggingface_hub import:
+# any accidental Hub attempt must fail loudly instead of silently reaching the
+# network. All model loading goes through local bundled weights (DEFAULT_MODEL).
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 import numpy as np
 import torch
 from PIL import Image
 
-DEFAULT_MODEL = "microsoft/trocr-small-printed"
+
+def _resolve_default_model_path() -> str:
+    """Locate the bundled trocr-small-printed weights on local disk.
+
+    Dev run:      <repo root>/models/trocr-small-printed
+    PyInstaller:  <_MEIPASS>/models/trocr-small-printed  (spec data entry)
+    Override:     LEDGERLENS_TROCR_MODEL environment variable
+    """
+    override = os.environ.get("LEDGERLENS_TROCR_MODEL")
+    if override:
+        return override
+    if getattr(sys, "frozen", False):
+        base = Path(sys._MEIPASS)  # noqa: SLF001 - PyInstaller standard
+    else:
+        base = Path(__file__).resolve().parent.parent
+    return str(base / "models" / "trocr-small-printed")
+
+
+DEFAULT_MODEL = _resolve_default_model_path()
 
 
 class TrOCRRecognizer:
@@ -45,7 +72,6 @@ class TrOCRRecognizer:
             import logging
 
             import transformers
-            from huggingface_hub import hf_hub_download
             from transformers import ViTImageProcessor
 
             logging.getLogger(__name__).warning(
@@ -54,7 +80,8 @@ class TrOCRRecognizer:
                 "from explicit components instead.",
                 model_name,
             )
-            with open(hf_hub_download(model_name, "tokenizer_config.json")) as fh:
+            model_dir = Path(model_name)
+            with open(model_dir / "tokenizer_config.json", encoding="utf-8") as fh:
                 tokenizer_class = json.load(fh).get("tokenizer_class", "XLMRobertaTokenizer")
             self.processor = TrOCRProcessor(
                 image_processor=ViTImageProcessor.from_pretrained(model_name),

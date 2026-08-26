@@ -101,3 +101,49 @@ class ValidateRequest(BaseModel):
 class ExportRequest(BaseModel):
     statement: StatementPayload
     format: Literal["json", "xlsx"] = "xlsx"
+
+
+class SnipExtractRequest(BaseModel):
+    """Region extraction request for the snip-first UI flow."""
+    session_id: Optional[str] = None
+    page_index: int = 0
+    bbox: BBox
+    field_hint: Optional[str] = "all"  # 'date', 'description', 'amount', 'all'
+
+
+class SnipExtractResponse(BaseModel):
+    raw_text: str
+    cleaned_text: str
+    parsed_date: Optional[str] = None
+    parsed_amount: Optional[float] = None
+    field_hint: str = "all"
+    confidence: float = 1.0
+    extraction_source: Literal["digital_native", "easyocr"] = "easyocr"
+
+
+class AuditLogRequest(BaseModel):
+    session_id: Optional[str] = None
+    transaction_index: int = 0
+    field_name: str
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+    page: Optional[int] = None
+    bbox: Optional[Dict[str, Any]] = None
+    source: Literal["auto", "manual_snip"] = "manual_snip"
+    confidence: Optional[float] = None
+    dry_run: bool = False  # compute + return status without persisting
+
+
+class AuditLogResponse(BaseModel):
+    id: Optional[int] = None          # None when dry_run=True
+    timestamp: Optional[str] = None   # None when dry_run=True
+    session_id: Optional[str] = None
+    transaction_index: int = 0
+    field_name: str
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+    page: Optional[int] = None
+    bbox: Optional[Dict[str, Any]] = None
+    source: str = "manual_snip"
+    status: str
+    confidence: Optional[float] = None

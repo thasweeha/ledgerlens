@@ -1,10 +1,17 @@
-"""Path B: flatbed scanned pipeline (spec §2).
+"""Path B: flatbed scanned pipeline for low-DPI bank statements.
 
-Renders pages at 300 DPI, corrects skew via Hough line analysis, removes
-scanner artifacts with bilateral filtering + adaptive thresholding, strips
-table ruling lines, segments word boxes geometrically, and recognizes each
-word crop with a pretrained TrOCR model to produce tokens with bounding
-boxes and confidence scores.
+Workflow per raster page:
+1. Render the PDF page at its detected native DPI (typically 150-200).
+2. Run pipeline.preprocessor.preprocess_scan to deskew, upscale to 400 DPI
+   equivalent with Lanczos, sharpen, apply CLAHE, and binarize.
+3. Segment words from the binary image and cluster them into visual text lines.
+4. Extract each line/chunk from the enhanced RGB image and recognize it with
+   EasyOCR (detector disabled).
+5. Project recognized text back onto the segmented word boxes and emit Token
+   objects scaled to PDF point space.
+
+The confidence threshold is intentionally low (0.25) so marginal but correct
+OCR results on noisy scans still survive to the column parser.
 """
 
 from __future__ import annotations
@@ -15,14 +22,16 @@ from typing import List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+from pipeline import preprocessor
 from pipeline.tokens import PageMode, Token
 
 MAX_SKEW_DEGREES = 15.0
-MIN_WORD_HEIGHT_PX = 8
-MIN_WORD_AREA_PX = 40
-OCR_BATCH_SIZE = 32
+MIN_WORD_HEIGHT_PX = 12
+MIN_WORD_AREA_PX = 80
+OCR_BATCH_SIZE = 16
 LINE_TARGET_HEIGHT_PX = 64
 LINE_MAX_ASPECT = 8.0
+OCR_CONFIDENCE_THRESHOLD = 0.25
 
 
 def _chunk_line_boxes(
@@ -47,7 +56,7 @@ def _chunk_line_boxes(
     return chunks
 
 
-def render_page(path: str | Path, page_index: int = 0, dpi: int = 300) -> np.ndarray:
+def render_page(path: str | Path, page_index: int = 0, dpi: int = 150) -> np.ndarray:
     """Render one PDF page into a high-resolution BGR image."""
     import pymupdf as fitz
 
@@ -73,7 +82,9 @@ def detect_native_dpi(
 
     Scanned PDFs often embed low-DPI JPEGs; rendering above the native
     resolution only interpolates soft strokes and degrades both thresholding
-    and neural recognition."""
+    and neural recognition.  We render at native DPI and let the preprocessor
+    perform a controlled Lanczos upscale.
+    """
     import pymupdf as fitz
 
     with fitz.open(path) as doc:
@@ -95,77 +106,14 @@ def detect_native_dpi(
                 best_coverage = coverage
                 best_dpi = info[2] / rect.width * 72.0
     if best_dpi is None:
-        return min(cap, max(floor, 300.0))
+        return min(cap, max(floor, preprocessor.DEFAULT_SOURCE_DPI))
     return min(cap, max(floor, best_dpi))
 
 
-def prepare_scan(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Bilateral filtering + adaptive thresholding: kills shadows, gradients,
-    and glass artifacts while keeping ink strokes crisp. Returns
-    (smoothed grayscale, inverted binary with ink = 255). Recognition crops
-    must come from the grayscale half; segmentation from the binary."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
-    smooth = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
-    binary = cv2.adaptiveThreshold(
-        smooth, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 15
-    )
-    return smooth, binary
-
-
-def estimate_skew(binary: np.ndarray) -> float:
-    """Median angle of long near-horizontal text/line strokes, in degrees."""
-    height, width = binary.shape[:2]
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(30, width // 30), 1))
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    lines = cv2.HoughLinesP(
-        closed,
-        rho=1,
-        theta=np.pi / 180,
-        threshold=int(width * 0.25),
-        minLineLength=int(width * 0.25),
-        maxLineGap=8,
-    )
-    if lines is None:
-        return 0.0
-    segments = np.asarray(lines).reshape(-1, 4)
-    angles: List[Tuple[float, float]] = []
-    for x0, y0, x1, y1 in segments:
-        length = float(np.hypot(x1 - x0, y1 - y0))
-        angle = float(np.degrees(np.arctan2(y1 - y0, x1 - x0)))
-        if abs(angle) <= MAX_SKEW_DEGREES:
-            angles.append((angle, length))
-    if not angles:
-        return 0.0
-    total_weight = sum(length for _, length in angles)
-    return sum(angle * length for angle, length in angles) / total_weight
-
-
-def deskew(binary: np.ndarray, max_angle: float = MAX_SKEW_DEGREES) -> Tuple[np.ndarray, float]:
-    """Rotate the page so baselines are horizontal; returns (image, angle)."""
-    angle = estimate_skew(binary)
-    return rotate_image(binary, angle, max_angle), angle
-
-
-def rotate_image(
-    image: np.ndarray, angle: float, max_angle: float = MAX_SKEW_DEGREES
-) -> np.ndarray:
-    """Apply the deskew transform to any image (binary or grayscale)."""
-    angle = max(-max_angle, min(max_angle, angle))
-    if abs(angle) < 0.3:
-        return image
-    height, width = image.shape[:2]
-    matrix = cv2.getRotationMatrix2D((width / 2, height / 2), angle, 1.0)
-    return cv2.warpAffine(
-        image,
-        matrix,
-        (width, height),
-        flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-
-
-def _merge_boxes(boxes: List[Tuple[int, int, int, int]], gap_ratio: float = 0.10) -> List[Tuple[int, int, int, int]]:
+def _merge_boxes(
+    boxes: List[Tuple[int, int, int, int]],
+    gap_ratio: float = 0.10,
+) -> List[Tuple[int, int, int, int]]:
     """Reunite glyph fragments of the same word (tiny gaps only); real
     inter-word gaps must survive so lane assignment stays meaningful."""
 
@@ -202,22 +150,11 @@ def _merge_boxes(boxes: List[Tuple[int, int, int, int]], gap_ratio: float = 0.10
     return boxes
 
 
-def remove_ruling_lines(binary: np.ndarray) -> np.ndarray:
-    """Strip long horizontal/vertical table rules so cell grids do not fuse
-    into single components that swallow the text inside them."""
-    height, width = binary.shape[:2]
-    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(40, width // 30), 1))
-    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(25, height // 60)))
-    horiz = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horiz_kernel)
-    vert = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vert_kernel)
-    return cv2.subtract(binary, cv2.bitwise_or(horiz, vert))
-
-
 def segment_word_bboxes(binary: np.ndarray) -> List[Tuple[int, int, int, int]]:
     """Fuse glyphs into words with a horizontal morphological close, then
     return word bounding boxes sorted top-to-bottom, left-to-right."""
     width = binary.shape[1]
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(5, width // 500), 1))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(5, width // 400), 1))
     closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     boxes = []
@@ -264,9 +201,10 @@ def _distribute_line_text(
     """Project recognized line text back onto detected word boxes.
 
     Words are placed at their proportional x-offset inside the line strip and
-    assigned to the nearest detected box; several recognized words may land
-    on one box (joined with spaces), empty boxes yield no token. The boolean
-    marks whether the box received any text."""
+    assigned to the nearest detected box; several recognized words may land on
+    one box (joined with spaces), empty boxes yield no token. The boolean marks
+    whether the box received any text.
+    """
     if not text.strip() or not line_boxes:
         return []
     x0 = min(b[0] for b in line_boxes)
@@ -280,6 +218,8 @@ def _distribute_line_text(
     offset = 0
     for piece in pieces:
         start = text.find(piece, offset)
+        if start < 0:
+            continue
         offset = start + len(piece)
         proj = x0 + span * ((start + len(piece) / 2) / total_chars)
         nearest = min(range(len(line_boxes)), key=lambda i: abs(centers[i] - proj))
@@ -298,33 +238,51 @@ def extract_page_tokens(
     page_index: int,
     recognizer=None,
     dpi: Optional[int] = None,
+    extract_checks: bool = False,
 ) -> dict:
-    """Full raster path for one page: render -> clean -> deskew -> segment ->
-    line grouping -> OCR per line strip -> project text back onto word boxes.
-    Recognition runs on smoothed grayscale strips (never binarized images);
-    segmentation uses the binary. `dpi=None` renders at the embedded image's
-    native resolution. Returns tokens in PDF point space plus diagnostics."""
-    if recognizer is None:
-        from pipeline.ocr_trocr import TrOCRRecognizer
+    """Full raster path for one page.
 
-        recognizer = TrOCRRecognizer()
+    Renders at the embedded image's native DPI, preprocesses for low-DPI OCR,
+    segments words from the binary image, groups them into lines, recognizes
+    each line strip with EasyOCR, and projects text back onto word boxes.
+    Recognition runs on the enhanced RGB image (never binarized).  Bounding
+    boxes are returned in PDF point space.
+
+    Args:
+        path: PDF file path.
+        page_index: 0-based page index.
+        recognizer: EasyOCR recognizer instance (created lazily if None).
+        dpi: Optional render DPI override.  None means native DPI.
+        extract_checks: If True, run check detection on the preprocessed page
+            and return detected checks in the result dict.
+
+    Returns:
+        Dict with keys: tokens, skew_angle, words_detected, lines_recognized,
+        low_confidence_words, source_dpi, effective_dpi, and optionally checks.
+    """
+    if recognizer is None:
+        from pipeline.ocr_easyocr import EasyOCRRecognizer
+
+        recognizer = EasyOCRRecognizer()
+
+    source_dpi = detect_native_dpi(path, page_index)
+    # All raster pages in this project are assumed to be low-DPI flatbed scans.
+    source_dpi = float(np.clip(source_dpi, preprocessor.MIN_SOURCE_DPI, preprocessor.MAX_SOURCE_DPI))
 
     if dpi is None:
-        # Render at 2x the embedded image's native resolution: low-DPI scans
-        # need smoother, taller strokes for thresholding and TrOCR, while
-        # anything beyond 300 DPI wastes cycles.
-        dpi = int(round(min(300.0, detect_native_dpi(path, page_index) * 2)))
+        dpi = int(round(source_dpi))
 
     image = render_page(path, page_index, dpi)
-    gray, binary = prepare_scan(image)
-    binary, skew_angle = deskew(binary)
-    if skew_angle:
-        gray = rotate_image(gray, skew_angle)
-    binary = remove_ruling_lines(binary)
-    boxes = segment_word_bboxes(binary)
-    scale = 72.0 / dpi
+    processed = preprocessor.preprocess_scan(image, source_dpi=source_dpi)
 
+    rgb = processed["rgb"]
+    binary = processed["binary"]
+    effective_dpi = float(processed["effective_dpi"])
+    scale = 72.0 / effective_dpi
+
+    boxes = segment_word_bboxes(binary)
     lines = group_lines(boxes)
+
     pad = 4
     crops: List[np.ndarray] = []
     chunk_map: List[List[Tuple[int, int, int, int]]] = []
@@ -332,11 +290,11 @@ def extract_page_tokens(
         for chunk in _chunk_line_boxes(line):
             x0 = min(b[0] for b in chunk)
             y0 = max(0, min(b[1] for b in chunk) - pad)
-            x1 = min(gray.shape[1], max(b[2] for b in chunk))
-            y1 = min(gray.shape[0], max(b[3] for b in chunk) + pad)
-            strip = gray[y0:y1, x0:x1]
+            x1 = min(rgb.shape[1], max(b[2] for b in chunk))
+            y1 = min(rgb.shape[0], max(b[3] for b in chunk) + pad)
+            strip = rgb[y0:y1, x0:x1]
             if not strip.size:
-                strip = np.zeros((8, 8), np.uint8)
+                strip = np.zeros((8, 8, 3), np.uint8)
             if strip.shape[0] < LINE_TARGET_HEIGHT_PX:
                 factor = LINE_TARGET_HEIGHT_PX / strip.shape[0]
                 strip = cv2.resize(
@@ -344,7 +302,7 @@ def extract_page_tokens(
                     None,
                     fx=factor,
                     fy=factor,
-                    interpolation=cv2.INTER_CUBIC,
+                    interpolation=cv2.INTER_LANCZOS4,
                 )
             crops.append(strip)
             chunk_map.append(chunk)
@@ -361,7 +319,7 @@ def extract_page_tokens(
     low_confidence = 0
     for chunk, text, confidence in zip(chunk_map, texts, confidences):
         for piece, box, _used in _distribute_line_text(text, chunk):
-            if confidence < 0.6:
+            if confidence < OCR_CONFIDENCE_THRESHOLD:
                 low_confidence += 1
             tokens.append(
                 Token(
@@ -377,11 +335,23 @@ def extract_page_tokens(
                     confidence=round(float(confidence), 4),
                 )
             )
+
+    # Sort top-to-bottom, left-to-right so the column parser sees logical rows.
     tokens.sort(key=lambda t: (t.y_center, t.x0))
-    return {
+
+    result: dict = {
         "tokens": tokens,
-        "skew_angle": round(skew_angle, 2),
+        "skew_angle": round(float(processed["skew_angle"]), 2),
         "words_detected": len(boxes),
         "lines_recognized": len(lines),
         "low_confidence_words": low_confidence,
+        "source_dpi": round(source_dpi, 1),
+        "effective_dpi": round(effective_dpi, 1),
     }
+
+    if extract_checks:
+        from pipeline import check_ocr
+
+        result["checks"] = check_ocr.detect_checks(rgb, page_index, recognizer)
+
+    return result

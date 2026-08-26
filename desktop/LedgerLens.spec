@@ -22,6 +22,10 @@ hidden = [
     "uvicorn.lifespan.on",
     "email.mime.multipart",
     "anyio._backends._asyncio",
+    "easyocr",
+    "easyocr.easyocr",
+    "easyocr.modules",
+    "easyocr.modules.vitstr",
 ]
 
 a = Analysis(
@@ -31,6 +35,7 @@ a = Analysis(
     datas=[
         (os.path.join(ROOT, "ui"), "ui"),
         (os.path.join(ROOT, "models", "hf"), "models" + os.sep + "hf"),
+        (os.path.join(ROOT, "models", "easyocr-models"), "models" + os.sep + "easyocr-models"),
     ],
     hiddenimports=hidden,
     hookspath=[],

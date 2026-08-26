@@ -571,7 +571,7 @@ body {
 }
 
 .popover-actions button:last-child {
-  grid-column: span 2;
+  grid-column: auto;
 }
 
 .ocr-loading {
@@ -581,6 +581,91 @@ body {
   font-size: 0.78rem;
   color: var(--text-secondary);
   padding: 0.5rem 0;
+}
+
+/* SNIP PREVIEW CHIPS & STATUS BADGES */
+.snip-chips-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-bottom: 0.5rem;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 0.18rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-input);
+  color: var(--text-secondary);
+}
+
+.source-chip {
+  font-weight: 500;
+  text-transform: uppercase;
+  font-size: 0.62rem;
+}
+
+.conf-high {
+  background: var(--accent-success-bg);
+  border-color: var(--accent-success-border);
+  color: var(--accent-success);
+}
+
+.conf-mid {
+  background: rgba(180, 83, 9, 0.12);
+  border-color: var(--accent-warning);
+  color: var(--accent-warning);
+}
+
+.conf-low {
+  background: var(--accent-danger-bg);
+  border-color: var(--accent-danger-border);
+  color: var(--accent-danger);
+}
+
+.snip-status-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-bottom: 0.6rem;
+}
+
+.status-chip.status-match {
+  background: var(--accent-success-bg);
+  border-color: var(--accent-success-border);
+  color: var(--accent-success);
+}
+
+.status-chip.status-different {
+  background: rgba(15, 118, 110, 0.1);
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.status-chip.status-lowconf {
+  background: rgba(180, 83, 9, 0.12);
+  border-color: var(--accent-warning);
+  color: var(--accent-warning);
+}
+
+.status-chip.status-conflict {
+  background: var(--accent-danger-bg);
+  border-color: var(--accent-danger-border);
+  color: var(--accent-danger);
+}
+
+.snip-target-line {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  border-top: 1px dashed var(--border-color);
+  padding-top: 0.45rem;
+  margin-top: 0.2rem;
 }
 
 /* RECONCILIATION DASHBOARD */

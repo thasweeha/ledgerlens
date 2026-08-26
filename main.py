@@ -145,14 +145,14 @@ def cmd_test_ocr(args):
     print("[*] Executing visual preprocessing and OCR engine...")
 
     try:
-        from pipeline.ocr_trocr import DEFAULT_MODEL, TrOCRRecognizer
+        from pipeline.ocr_easyocr import EasyOCRRecognizer, DEFAULT_MODEL_DIR
 
-        recognizer = TrOCRRecognizer()
+        recognizer = EasyOCRRecognizer()
         predicted, confidence = recognizer.recognize(np.array(img.convert("L")))
-        status = f"{DEFAULT_MODEL}"
+        status = f"{DEFAULT_MODEL_DIR}"
     except Exception as exc:
         predicted, confidence = "", 0.0
-        status = f"TrOCR load failed ({exc})"
+        status = f"EasyOCR load failed ({exc})"
 
     print("\n" + "-" * 45)
     print("           OCR INFERENCE TEST RESULT")

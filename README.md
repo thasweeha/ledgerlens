@@ -102,10 +102,10 @@ and cached locally.
 ### A. Interactive Dual-Pane UI
 
 ```bash
-python main.py serve --host 127.0.0.1 --port 8000 --reload
+python main.py serve --host 127.0.0.1 --port 8080 --reload
 ```
 
-Open [http://127.0.0.1:8000/](http://127.0.0.1:8000/) (API docs at `/docs`).
+Open [http://127.0.0.1:8080/](http://127.0.0.1:8080/) (API docs at `/docs`).
 
 - **Left pane:** 300 DPI canvas viewer with zoom/pan, bounding-box overlays per
   cell, click-to-focus row, and a drag-to-select region re-OCR popover.

@@ -4,7 +4,7 @@ Provides REST endpoints for PDF upload, 300 DPI page image serving,
 drag-to-select re-OCR, real-time reconciliation calculation, and JSON/XLSX export.
 
 Extraction is delegated to the unified hybrid pipeline (pipeline.engine),
-which routes each page through the digital-vector or TrOCR raster path.
+which routes each page through the digital-vector or EasyOCR raster path.
 """
 from typing import Dict, Any, Optional, List
 import io
@@ -33,15 +33,27 @@ from backend.schemas import (
     ReOCRRequest,
     ReOCRResponse,
     ValidateRequest,
-    ExportRequest
+    ExportRequest,
+    SnipExtractRequest,
+    SnipExtractResponse,
+    AuditLogRequest,
+    AuditLogResponse
 )
+from backend.services import audit_service
 from backend.services.export_service import generate_json_bytes, generate_xlsx_bytes
 
 
 # In-memory storage for active statement processing sessions
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 
-# Lazily-initialized TrOCR recognizer (model weights load on first re-OCR use)
+# Flat confidence assigned to native (vector stream) region extraction --
+# mirrors the pipeline convention where digital tokens carry confidence 1.0.
+NATIVE_EXTRACTION_CONFIDENCE = 0.99
+
+# Fields eligible for audit logging / server-side baseline lookup
+_AUDITABLE_FIELDS = {"date", "description", "amount", "balance", "type"}
+
+# Lazily-initialized EasyOCR recognizer (model weights load on first re-OCR use)
 _OCR_RECOGNIZER = None
 
 app = FastAPI(
@@ -68,12 +80,12 @@ VIEWER_DPI = 300
 
 
 def _get_recognizer():
-    """Lazily loads the shared TrOCR recognizer used by /api/re-ocr."""
+    """Lazily loads the shared EasyOCR recognizer used by /api/re-ocr."""
     global _OCR_RECOGNIZER
     if _OCR_RECOGNIZER is None:
-        from pipeline.ocr_trocr import TrOCRRecognizer
+        from pipeline.ocr_easyocr import EasyOCRRecognizer
 
-        _OCR_RECOGNIZER = TrOCRRecognizer()
+        _OCR_RECOGNIZER = EasyOCRRecognizer()
     return _OCR_RECOGNIZER
 
 
@@ -122,6 +134,18 @@ def _parse_date_text(text: Optional[str]) -> Optional[str]:
     return None
 
 
+def _plausible_amount_token(token: str) -> bool:
+    """
+    Guard for the rightmost-token scan: reject bare digit fragments such as
+    '00' or '7' left behind by clipped text or noisy OCR. A token counts as
+    plausible when it carries an amount marker (. , $ ( ) + - CR DR) or has
+    at least three digits.
+    """
+    if re.search(r"[.,$()+\-]|CR|DR", token, re.IGNORECASE):
+        return True
+    return len(re.sub(r"\D", "", token)) >= 3
+
+
 def _parse_amount_text(text: Optional[str]) -> Optional[float]:
     """Extracts a currency amount from OCR text using the pipeline's money parser."""
     if not text:
@@ -131,6 +155,8 @@ def _parse_amount_text(text: Optional[str]) -> Optional[float]:
         return float(direct)
     # Amounts usually sit rightmost on a row; scan tokens right-to-left.
     for token in reversed(re.split(r"\s+", text.strip())):
+        if not _plausible_amount_token(token):
+            continue
         val = parse_amount_decimal(token)
         if val is not None:
             return float(val)
@@ -317,10 +343,11 @@ async def upload_statement(file: UploadFile = File(...)):
         reconciliation=recon_summary
     )
 
-    # Cache session
+    # Cache session (pdf bytes retained additively for native snip extraction)
     SESSIONS[session_id] = {
         "statement": statement_payload,
-        "pages": rendered
+        "pages": rendered,
+        "pdf_bytes": content
     }
 
     return statement_payload
@@ -408,6 +435,166 @@ def _crop_region(page_image: Image.Image, bbox: BBox) -> Image.Image:
         return Image.new("RGB", (10, 10), color="white")
 
     return page_image.crop((x1, y1, x2, y2))
+
+
+def _extract_native_region_text(pdf_bytes: bytes, page_index: int, bbox: BBox) -> str:
+    """
+    Native (vector stream) text extraction inside a 300 DPI-space bbox.
+    Scales the box into PDF point space (72 DPI) and clips PyMuPDF text
+    extraction to that region. Returns "" when nothing can be extracted.
+    """
+    scale = 72.0 / VIEWER_DPI
+    try:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return ""
+    try:
+        if not (0 <= page_index < len(doc)):
+            return ""
+        page = doc[page_index]
+        rect = pymupdf.Rect(
+            bbox.x * scale,
+            bbox.y * scale,
+            (bbox.x + bbox.width) * scale,
+            (bbox.y + bbox.height) * scale,
+        )
+        rect &= page.rect
+        if rect.is_empty or rect.is_infinite:
+            return ""
+        return page.get_text("text", clip=rect) or ""
+    except Exception:
+        return ""
+    finally:
+        doc.close()
+
+
+def _ocr_region_result(crop: Image.Image, field_hint: str) -> SnipExtractResponse:
+    """Runs EasyOCR over a crop and maps the result onto SnipExtractResponse."""
+    try:
+        recognizer = _get_recognizer()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"OCR model unavailable: {str(e)}")
+
+    raw_text, confidence = recognizer.recognize(np.array(crop.convert("L")))
+    cleaned_text = raw_text.strip()
+
+    return SnipExtractResponse(
+        raw_text=raw_text,
+        cleaned_text=cleaned_text,
+        parsed_date=_parse_date_text(cleaned_text),
+        parsed_amount=_parse_amount_text(cleaned_text),
+        field_hint=field_hint,
+        confidence=round(confidence, 4) if cleaned_text else 0.0,
+        extraction_source="easyocr"
+    )
+
+
+@app.post("/api/snip-extract", response_model=SnipExtractResponse)
+async def snip_extract_endpoint(req: SnipExtractRequest):
+    """
+    Region extraction for the snip-first flow.
+
+    Vector pages -> native PDF text extraction within the clipped region
+    (flat high confidence). Scanned pages (or sessions without the source
+    PDF) -> EasyOCR over the cropped 300 DPI render (recognizer-reported
+    confidence).
+    """
+    field_hint = req.field_hint or "all"
+
+    session = SESSIONS.get(req.session_id) if req.session_id else None
+    pdf_bytes = session.get("pdf_bytes") if session else None
+
+    page_type = None
+    if session:
+        pages_info = session["statement"].pages
+        if 0 <= req.page_index < len(pages_info):
+            page_type = pages_info[req.page_index].type
+
+    if pdf_bytes and page_type == "vector":
+        native_text = _extract_native_region_text(pdf_bytes, req.page_index, req.bbox)
+        cleaned = " ".join(native_text.split())
+        return SnipExtractResponse(
+            raw_text=native_text,
+            cleaned_text=cleaned,
+            parsed_date=_parse_date_text(cleaned),
+            parsed_amount=_parse_amount_text(cleaned),
+            field_hint=field_hint,
+            confidence=NATIVE_EXTRACTION_CONFIDENCE if cleaned else 0.0,
+            extraction_source="digital_native"
+        )
+
+    # Scanned / fallback path: EasyOCR over the rendered 300 DPI page image.
+    page_img = None
+    if session:
+        pages = session["pages"]
+        if 0 <= req.page_index < len(pages):
+            page_img = pages[req.page_index]["image"]
+
+    if page_img is None:
+        return SnipExtractResponse(
+            raw_text="", cleaned_text="", field_hint=field_hint,
+            confidence=0.0, extraction_source="easyocr"
+        )
+
+    return _ocr_region_result(_crop_region(page_img, req.bbox), field_hint)
+
+
+def _lookup_baseline_field(session_id: Optional[str], transaction_index: int, field_name: str):
+    """
+    Server-side baseline for status classification: the value the automatic
+    pipeline currently holds for this transaction field. Returns None when the
+    session/index/field is unknown (e.g. manual or demo rows) -- callers then
+    fall back to the client-provided old_value.
+    """
+    if not session_id or session_id not in SESSIONS:
+        return None
+    stmt = SESSIONS[session_id]["statement"]
+    if not (0 <= transaction_index < len(stmt.transactions)):
+        return None
+    row = stmt.transactions[transaction_index]
+    return getattr(row, field_name, None)
+
+
+@app.post("/api/audit-log", response_model=AuditLogResponse)
+async def audit_log_endpoint(req: AuditLogRequest):
+    """
+    Records one field change in the audit trail. `status` is computed
+    SERVER-SIDE from the session's stored pipeline value (baseline) and the
+    reported OCR confidence -- never from client-supplied classification.
+
+    dry_run=true computes and returns the status without persisting a row
+    (used by the frontend preview panel before the user clicks Apply).
+    """
+    if req.field_name not in _AUDITABLE_FIELDS:
+        raise HTTPException(status_code=400, detail=f"field_name must be one of {sorted(_AUDITABLE_FIELDS)}")
+
+    baseline = _lookup_baseline_field(req.session_id, req.transaction_index, req.field_name)
+    old_value = baseline if baseline is not None else (req.old_value or "")
+
+    status = audit_service.compute_status(
+        req.field_name,
+        old_value,
+        req.new_value or "",
+        req.confidence,
+    )
+
+    payload = dict(
+        session_id=req.session_id or "",
+        transaction_index=req.transaction_index,
+        field_name=req.field_name,
+        old_value="" if old_value is None else str(old_value),
+        new_value=req.new_value or "",
+        page=req.page,
+        bbox=req.bbox,
+        source=req.source,
+        confidence=req.confidence,
+    )
+
+    if req.dry_run:
+        return AuditLogResponse(status=status, **payload)
+
+    row = audit_service.log_change(status=status, **payload)
+    return AuditLogResponse(**row)
 
 
 def _decode_base64_image(b64_string: str) -> Image.Image:

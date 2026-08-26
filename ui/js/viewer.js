@@ -1,19 +1,31 @@
 /**
- * LedgerLens - Canvas Document Viewer & 300 DPI Drag-to-Select Re-OCR Tool
+ * LedgerLens - Canvas Document Viewer & Snip-First Extraction Tool
  * Handles high-resolution canvas rendering, pixel-exact coordinate translation,
- * visual bounding box overlays, and region crop OCR.
+ * pending/confirmed bounding-box overlays, and the click-or-drag snip flow:
+ * extract region -> preview (text + confidence + server-computed status) ->
+ * Apply writes the cell AND appends to the audit trail.
  */
 
 const Viewer = (() => {
+  // ---- Configuration constants (confidence badge thresholds, percent) ----
+  const CONFIDENCE_HIGH = 85;  // >= this -> green badge
+  const CONFIDENCE_LOW = 50;   // < this -> red badge; between -> amber
+
   // DOM Elements
   let viewport, stage, docCanvas, overlayCanvas, docCtx, overlayCtx, selectionBox, ocrPopover;
   let zoomDisplay, toolCropBtn, toolPanBtn, toggleBBoxesBtn;
+  let snipConfidenceChip, snipSourceChip, snipStatusRow, snipTargetLine;
+  let snipApplyBtn, snipCancelBtn, ocrLoading, ocrContent, ocrExtractedText;
+
+  const SNIP_LOADING_HTML = `<div class="spinner"></div><span id="snipLoadingText">Extracting region...</span>`;
 
   // State
   let currentImage = null;
   let currentPageIndex = 0;
   let currentSessionId = null;
+  let currentPageType = "vector"; // "vector" | "scanned" (routing signal from pipeline)
   let currentBBoxes = []; // List of transaction bounding boxes on this page
+  let confirmedRowIds = new Set(); // Rows whose values were snip-applied at least once
   let activeHoverBox = null;
   let activeSelectedRowId = null;
   let showBBoxes = true;
@@ -30,8 +42,9 @@ const Viewer = (() => {
   let selStartX = 0, selStartY = 0;
   let lastSelectionBBox300DPI = null; // in 300 DPI image pixels
 
-  // Active OCR result cache
-  let lastOCRResult = null;
+  // Current snip preview context
+  let currentSnip = null;
+  // Shape: { bbox300, fieldHint, originRowId, result, fields, statuses }
 
   function init() {
     viewport = document.getElementById("viewerViewport");
@@ -47,6 +60,16 @@ const Viewer = (() => {
     toolCropBtn = document.getElementById("toolCropBtn");
     toolPanBtn = document.getElementById("toolPanBtn");
     toggleBBoxesBtn = document.getElementById("toggleBBoxesBtn");
+
+    snipConfidenceChip = document.getElementById("snipConfidenceChip");
+    snipSourceChip = document.getElementById("snipSourceChip");
+    snipStatusRow = document.getElementById("snipStatusRow");
+    snipTargetLine = document.getElementById("snipTargetLine");
+    snipApplyBtn = document.getElementById("snipApplyBtn");
+    snipCancelBtn = document.getElementById("snipCancelBtn");
+    ocrLoading = document.getElementById("ocrLoading");
+    ocrContent = document.getElementById("ocrContent");
+    ocrExtractedText = document.getElementById("ocrExtractedText");
 
     bindEvents();
   }
@@ -68,7 +91,7 @@ const Viewer = (() => {
       drawOverlays();
     });
 
-    // Viewport mouse interactions (Pan & Drag-to-Select)
+    // Viewport mouse interactions (Pan & Drag-to-Snip)
     viewport.addEventListener("mousedown", onMouseDown);
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", onMouseUp);
@@ -76,14 +99,10 @@ const Viewer = (() => {
     // Wheel zoom
     viewport.addEventListener("wheel", onWheel, { passive: false });
 
-    // Popover close button
+    // Snip preview actions
     document.getElementById("ocrPopoverClose").addEventListener("click", hidePopover);
-
-    // Popover action buttons
-    document.getElementById("ocrSetDateBtn").addEventListener("click", () => applyOCRField("date"));
-    document.getElementById("ocrSetDescBtn").addEventListener("click", () => applyOCRField("description"));
-    document.getElementById("ocrSetAmtBtn").addEventListener("click", () => applyOCRField("amount"));
-    document.getElementById("ocrInsertRowBtn").addEventListener("click", insertOCRAsNewRow);
+    snipCancelBtn.addEventListener("click", hidePopover);
+    snipApplyBtn.addEventListener("click", applySnip);
   }
 
   function setMode(mode) {
@@ -114,12 +133,14 @@ const Viewer = (() => {
   }
 
   /**
-   * Loads a 300 DPI page image and its bounding box metadata.
+   * Loads a 300 DPI page image, its bounding box metadata, and the page's
+   * routing type ("vector" | "scanned") which selects native vs OCR snipping.
    */
-  function loadPage(pageIndex, imageUrl, sessionId, bboxes = []) {
+  function loadPage(pageIndex, imageUrl, sessionId, bboxes = [], pageType = "vector") {
     currentPageIndex = pageIndex;
     currentSessionId = sessionId;
     currentBBoxes = bboxes;
+    currentPageType = pageType;
     hidePopover();
 
     const img = new Image();
@@ -165,7 +186,9 @@ const Viewer = (() => {
   }
 
   /**
-   * Renders visual bounding box overlays scaled by current zoom factor.
+   * Renders bounding-box overlays scaled by current zoom factor.
+   * Pipeline-detected rows start as dimmed dashed "pending" overlays;
+   * rows confirmed via snip Apply switch to solid teal.
    */
   function drawOverlays() {
     if (!overlayCtx || !currentImage) return;
@@ -177,6 +200,7 @@ const Viewer = (() => {
 
     currentBBoxes.forEach((item) => {
       const isSelected = (item.id === activeSelectedRowId);
+      const isConfirmed = confirmedRowIds.has(item.id);
 
       // Draw main row box
       if (item.bbox) {
@@ -185,37 +209,41 @@ const Viewer = (() => {
         const rw = item.bbox.width * zoom;
         const rh = item.bbox.height * zoom;
 
+        overlayCtx.setLineDash(isConfirmed ? [] : [6, 4]);
+
         if (isSelected) {
           overlayCtx.strokeStyle = "#38bdf8";
           overlayCtx.fillStyle = "rgba(56, 189, 248, 0.18)";
-          overlayCtx.fillRect(rx, ry, rw, rh);
-          overlayCtx.strokeRect(rx, ry, rw, rh);
+        } else if (isConfirmed) {
+          overlayCtx.strokeStyle = "rgba(15, 118, 110, 0.8)";
+          overlayCtx.fillStyle = "rgba(15, 118, 110, 0.07)";
         } else {
-          overlayCtx.strokeStyle = "rgba(148, 163, 184, 0.4)";
+          // Pending: dimmed dashed grey
+          overlayCtx.strokeStyle = "rgba(148, 163, 184, 0.55)";
           overlayCtx.fillStyle = "rgba(148, 163, 184, 0.04)";
-          overlayCtx.fillRect(rx, ry, rw, rh);
-          overlayCtx.strokeRect(rx, ry, rw, rh);
         }
+        overlayCtx.fillRect(rx, ry, rw, rh);
+        overlayCtx.strokeRect(rx, ry, rw, rh);
+        overlayCtx.setLineDash([]);
       }
 
-      // Draw modular column boxes if available
+      // Draw modular column boxes if available (dimmer while pending)
+      overlayCtx.globalAlpha = isConfirmed ? 0.9 : 0.4;
       if (item.date_bbox) {
-        const dx = item.date_bbox.x * zoom;
-        const dy = item.date_bbox.y * zoom;
-        const dw = item.date_bbox.width * zoom;
-        const dh = item.date_bbox.height * zoom;
         overlayCtx.strokeStyle = "rgba(59, 130, 246, 0.5)";
-        overlayCtx.strokeRect(dx, dy, dw, dh);
+        strokeItemBox(item.date_bbox);
+      }
+
+      if (item.desc_bbox) {
+        overlayCtx.strokeStyle = "rgba(148, 163, 184, 0.45)";
+        strokeItemBox(item.desc_bbox);
       }
 
       if (item.amount_bbox) {
-        const ax = item.amount_bbox.x * zoom;
-        const ay = item.amount_bbox.y * zoom;
-        const aw = item.amount_bbox.width * zoom;
-        const ah = item.amount_bbox.height * zoom;
         overlayCtx.strokeStyle = (item.type === "credit") ? "rgba(16, 185, 129, 0.6)" : "rgba(239, 68, 68, 0.6)";
-        overlayCtx.strokeRect(ax, ay, aw, ah);
+        strokeItemBox(item.amount_bbox);
       }
+      overlayCtx.globalAlpha = 1.0;
     });
 
     // Draw active hover box
@@ -228,11 +256,16 @@ const Viewer = (() => {
         activeHoverBox.width * zoom,
         activeHoverBox.height * zoom
       );
+      overlayCtx.lineWidth = 1.5;
     }
   }
 
+  function strokeItemBox(b) {
+    overlayCtx.strokeRect(b.x * zoom, b.y * zoom, b.width * zoom, b.height * zoom);
+  }
+
   /**
-   * Mouse Down Handler: initiates panning or drag-to-select box.
+   * Mouse Down Handler: initiates panning or drag-to-snip selection.
    */
   function onMouseDown(e) {
     if (!currentImage) return;
@@ -344,7 +377,7 @@ const Viewer = (() => {
   }
 
   /**
-   * Mouse Up Handler: finalizes selection and triggers 300 DPI precision Re-OCR.
+   * Mouse Up Handler: finalizes a drag-selection and triggers a region snip.
    */
   function onMouseUp(e) {
     if (isPanning) {
@@ -363,7 +396,7 @@ const Viewer = (() => {
       const widthPx = Math.abs(currentX - selStartX);
       const heightPx = Math.abs(currentY - selStartY);
 
-      // If selection is tiny, treat as a single click
+      // If selection is tiny, treat as a single click on a pending box
       if (widthPx < 8 || heightPx < 8) {
         selectionBox.style.display = "none";
         handleCanvasClick(leftPx / zoom, topPx / zoom);
@@ -380,34 +413,46 @@ const Viewer = (() => {
       };
       lastSelectionBBox300DPI = bbox300DPI;
 
-      // Position Popover near selection
-      showPopover(leftPx + stageRect.left - viewport.getBoundingClientRect().left, topPx + heightPx + 10);
-      executeReOCR(bbox300DPI);
+      startSnip(bbox300DPI, "all", null);
     }
   }
 
   /**
-   * Handle single click on canvas to select corresponding row in editor grid.
+   * Single click on canvas: if it lands on a detected row box, select the
+   * grid row AND snip that region (sub-box precision for column hits).
    */
   function handleCanvasClick(x300, y300) {
     for (const item of currentBBoxes) {
-      if (item.bbox) {
-        const b = item.bbox;
-        if (
-          x300 >= b.x &&
-          x300 <= b.x + b.width &&
-          y300 >= b.y &&
-          y300 <= b.y + b.height
-        ) {
-          activeSelectedRowId = item.id;
-          drawOverlays();
-          if (window.Editor && typeof window.Editor.selectRowById === "function") {
-            window.Editor.selectRowById(item.id);
-          }
-          break;
+      if (!item.bbox) continue;
+      const b = item.bbox;
+      if (
+        x300 >= b.x &&
+        x300 <= b.x + b.width &&
+        y300 >= b.y &&
+        y300 <= b.y + b.height
+      ) {
+        activeSelectedRowId = item.id;
+        drawOverlays();
+        if (window.Editor && typeof window.Editor.selectRowById === "function") {
+          window.Editor.selectRowById(item.id);
         }
+        const hit = detectFieldHit(item, x300, y300);
+        startSnip(hit.bbox, hit.hint, item.id);
+        return;
       }
     }
+  }
+
+  /**
+   * Determines which column sub-box (if any) contains the click, giving the
+   * snip a precise region and a single-field target hint.
+   */
+  function detectFieldHit(item, x300, y300) {
+    const inside = (b) => b && x300 >= b.x && x300 <= b.x + b.width && y300 >= b.y && y300 <= b.y + b.height;
+    if (inside(item.date_bbox)) return { hint: "date", bbox: item.date_bbox };
+    if (inside(item.desc_bbox)) return { hint: "description", bbox: item.desc_bbox };
+    if (inside(item.amount_bbox)) return { hint: "amount", bbox: item.amount_bbox };
+    return { hint: "all", bbox: item.bbox };
   }
 
   function onWheel(e) {
@@ -418,46 +463,300 @@ const Viewer = (() => {
     }
   }
 
-  /**
-   * Re-OCR API execution.
-   */
-  async function executeReOCR(bbox) {
-    const loading = document.getElementById("ocrLoading");
-    const content = document.getElementById("ocrContent");
-    loading.style.display = "flex";
-    content.style.display = "none";
+  // ---------------------------------------------------------------------
+  // Snip-first extraction flow
+  // ---------------------------------------------------------------------
 
+  /**
+   * Opens the preview panel near the region and extracts it. Vector pages
+   * use the native PDF text stream; scanned pages use TrOCR (backend decides).
+   */
+  function startSnip(bbox, fieldHint, originRowId) {
+    if (!currentSessionId) return;
+
+    const vpRect = viewport.getBoundingClientRect();
+    const stageRect = stage.getBoundingClientRect();
+
+    currentSnip = { bbox300: bbox, fieldHint, originRowId, result: null, fields: {}, statuses: {} };
+
+    showPopover(
+      bbox.x * zoom + (stageRect.left - vpRect.left),
+      bbox.height * zoom + bbox.y * zoom + (stageRect.top - vpRect.top) + 10
+    );
+
+    ocrLoading.innerHTML = SNIP_LOADING_HTML;
+    const loadingText = document.getElementById("snipLoadingText");
+    if (loadingText) {
+      loadingText.textContent = (currentPageType === "vector")
+        ? "Reading native text stream..."
+        : "Scanning region with OCR...";
+    }
+    ocrLoading.style.display = "flex";
+    ocrContent.style.display = "none";
+
+    executeSnip(bbox, fieldHint);
+  }
+
+  async function executeSnip(bbox, fieldHint) {
     try {
-      const res = await fetch("/api/re-ocr", {
+      const res = await fetch("/api/snip-extract", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           session_id: currentSessionId,
           page_index: currentPageIndex,
           bbox: bbox,
-          target_field: "all"
+          field_hint: fieldHint
         })
       });
 
-      if (!res.ok) throw new Error("Re-OCR request failed");
+      if (!res.ok) throw new Error("Extraction request failed");
       const data = await res.json();
-      lastOCRResult = data;
+      if (currentSnip) currentSnip.result = data;
 
-      document.getElementById("ocrExtractedText").value = data.cleaned_text || "";
-      document.getElementById("ocrParsedDate").textContent = data.parsed_date || "—";
-      document.getElementById("ocrParsedAmount").textContent = (data.parsed_amount !== null) ? `$${data.parsed_amount.toFixed(2)}` : "—";
-
-      loading.style.display = "none";
-      content.style.display = "block";
+      renderSnipPreview(data);
     } catch (err) {
-      loading.innerHTML = `<span style="color:var(--accent-danger);">OCR Failed: ${err.message}</span>`;
+      ocrLoading.innerHTML = `<span style="color:var(--accent-danger);">Extraction failed: ${err.message}</span>`;
     }
+  }
+
+  /**
+   * Maps an extraction result onto the fields that Apply will write.
+   */
+  function fieldsFromResult(result, fieldHint) {
+    const fields = {};
+    const cleaned = (result.cleaned_text || "").trim();
+
+    if ((fieldHint === "all" || fieldHint === "date") && result.parsed_date) {
+      fields.date = result.parsed_date;
+    }
+    if ((fieldHint === "all" || fieldHint === "amount") &&
+        result.parsed_amount !== null && result.parsed_amount !== undefined) {
+      fields.amount = result.parsed_amount;
+    }
+    if ((fieldHint === "all" || fieldHint === "description") && cleaned) {
+      fields.description = cleaned;
+    }
+    return fields;
+  }
+
+  function confidenceClass(pct) {
+    if (pct >= CONFIDENCE_HIGH) return "conf-high";
+    if (pct >= CONFIDENCE_LOW) return "conf-mid";
+    return "conf-low";
+  }
+
+  const STATUS_LABELS = {
+    MATCH: "MATCH",
+    DIFFERENT: "FILLED",
+    LOW_CONFIDENCE: "LOW CONF.",
+    CONFLICT: "CONFLICT"
+  };
+
+  const STATUS_CLASSES = {
+    MATCH: "status-match",
+    DIFFERENT: "status-different",
+    LOW_CONFIDENCE: "status-lowconf",
+    CONFLICT: "status-conflict"
+  };
+
+  function renderSnipPreview(data) {
+    ocrExtractedText.value = data.cleaned_text || "";
+    document.getElementById("ocrParsedDate").textContent = data.parsed_date || "—";
+    document.getElementById("ocrParsedAmount").textContent =
+      (data.parsed_amount !== null && data.parsed_amount !== undefined) ? `$${data.parsed_amount.toFixed(2)}` : "—";
+
+    // Confidence badge (color-coded via configurable thresholds)
+    const pct = Math.round((data.confidence || 0) * 100);
+    snipConfidenceChip.className = `chip conf-chip ${confidenceClass(pct)}`;
+    snipConfidenceChip.textContent = `Confidence ${pct}%`;
+
+    // Extraction source badge
+    const isNative = data.extraction_source === "digital_native";
+    snipSourceChip.textContent = isNative ? "Native Text" : "TrOCR OCR";
+
+    currentSnip.fields = fieldsFromResult(data, currentSnip.fieldHint);
+    const fieldCount = Object.keys(currentSnip.fields).length;
+    snipApplyBtn.disabled = (fieldCount === 0);
+
+    renderTargetLine(fieldCount);
+    renderStatusChips(); // placeholder chips until server responds
+
+    ocrLoading.style.display = "none";
+    ocrContent.style.display = "block";
+
+    fetchPreviewStatuses();
+  }
+
+  /**
+   * Resolves which grid row the snip will be applied to.
+   * Priority: originating clicked row > active editor row > new row.
+   */
+  function resolveTarget() {
+    if (!window.Editor) return { rowIndex: null };
+    if (currentSnip.originRowId) {
+      const idx = window.Editor.resolveRowIndex(currentSnip.originRowId);
+      if (idx >= 0) return { rowIndex: idx };
+    }
+    const actIdx = window.Editor.getActiveRowIndex();
+    if (actIdx >= 0) return { rowIndex: actIdx };
+    return { rowIndex: null };
+  }
+
+  function renderTargetLine(fieldCount) {
+    const target = resolveTarget();
+    const fieldNames = Object.keys(currentSnip.fields);
+    const fieldLabel = fieldCount === 0
+      ? "nothing parseable detected"
+      : fieldNames.join(", ");
+    const targetLabel = (target.rowIndex === null)
+      ? "a NEW row"
+      : `Row ${target.rowIndex + 1}`;
+    snipTargetLine.textContent = `Apply target: ${targetLabel} — ${fieldLabel}`;
+  }
+
+  function renderStatusChips() {
+    snipStatusRow.innerHTML = "";
+    const entries = Object.entries(currentSnip.fields);
+    if (entries.length === 0) {
+      snipStatusRow.innerHTML = `<span class="chip">No text detected</span>`;
+      return;
+    }
+    entries.forEach(([fieldName]) => {
+      const known = currentSnip.statuses[fieldName];
+      const cls = known ? (STATUS_CLASSES[known] || "") : "";
+      const label = known ? (STATUS_LABELS[known] || known) : "…";
+      const chip = document.createElement("span");
+      chip.className = `chip status-chip ${cls}`;
+      chip.dataset.field = fieldName;
+      chip.textContent = `${fieldName}: ${label}`;
+      snipStatusRow.appendChild(chip);
+    });
+  }
+
+  /**
+   * Asks the SERVER to classify each candidate field (dry_run=true --
+   * computed authoritatively server-side, nothing persisted yet) so the
+   * user sees MATCH / FILLED / LOW CONF. / CONFLICT before clicking Apply.
+   */
+  async function fetchPreviewStatuses() {
+    const target = resolveTarget();
+    const txnIndex = (target.rowIndex !== null) ? target.rowIndex : -1;
+
+    const entries = Object.entries(currentSnip.fields);
+    const results = await Promise.all(entries.map(async ([fieldName, val]) => {
+      const oldValue = window.Editor.peekFieldValue
+        ? window.Editor.peekFieldValue(target.rowIndex, fieldName)
+        : "";
+      try {
+        const res = await fetch("/api/audit-log", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: currentSessionId,
+            transaction_index: txnIndex,
+            field_name: fieldName,
+            old_value: (oldValue === null || oldValue === undefined) ? "" : String(oldValue),
+            new_value: String(val),
+            page: currentSnip.bbox300.page,
+            bbox: currentSnip.bbox300,
+            source: "manual_snip",
+            confidence: currentSnip.result ? currentSnip.result.confidence : null,
+            dry_run: true
+          })
+        });
+        if (!res.ok) throw new Error("status computation failed");
+        const data = await res.json();
+        return [fieldName, data.status];
+      } catch (err) {
+        console.warn("Preview status failed:", err);
+        return [fieldName, null];
+      }
+    }));
+
+    if (!currentSnip) return;
+    results.forEach(([fieldName, status]) => { currentSnip.statuses[fieldName] = status; });
+
+    // Only repaint if this preview is still the visible one
+    if (ocrPopover.style.display !== "none" && ocrContent.style.display === "block") {
+      renderStatusChips();
+    }
+  }
+
+  /**
+   * Apply: writes extracted values into the target cell(s) via the Editor,
+   * marks the row confirmed on canvas, and persists one audit row per
+   * changed field (source="manual_snip").
+   */
+  async function applySnip() {
+    if (!currentSnip || !currentSnip.result) return;
+
+    const fields = fieldsFromResult(currentSnip.result, currentSnip.fieldHint);
+    // Respect manual edits made in the preview text input
+    const userInput = (ocrExtractedText.value || "").trim();
+    if (fields.description && userInput) fields.description = userInput;
+
+    if (Object.keys(fields).length === 0) {
+      hidePopover();
+      return;
+    }
+
+    const target = resolveTarget();
+    let applied = null;
+    try {
+      applied = window.Editor.applySnipFields(
+        target.rowIndex,
+        fields,
+        { page: currentPageIndex + 1, bbox: currentSnip.bbox300 }
+      );
+    } catch (err) {
+      console.error("Failed to apply snip:", err);
+      return;
+    }
+    if (!applied) return;
+
+    if (applied.rowId) {
+      confirmedRowIds.add(applied.rowId);
+      drawOverlays();
+    }
+
+    // Audit trail: one row per changed field (best-effort, non-blocking UI)
+    const snipMeta = {
+      sessionId: currentSessionId,
+      page: currentSnip.bbox300.page,
+      bbox: currentSnip.bbox300,
+      confidence: currentSnip.result.confidence
+    };
+    for (const change of (applied.changes || [])) {
+      postAuditEntry(snipMeta, applied.rowIndex, change);
+    }
+
+    hidePopover();
+  }
+
+  function postAuditEntry(meta, rowIndex, change) {
+    fetch("/api/audit-log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: meta.sessionId,
+        transaction_index: rowIndex,
+        field_name: change.field_name,
+        old_value: change.old_value,
+        new_value: change.new_value,
+        page: meta.page,
+        bbox: meta.bbox,
+        source: "manual_snip",
+        confidence: meta.confidence,
+        dry_run: false
+      })
+    }).catch((err) => console.warn("Audit log failed:", err));
   }
 
   function showPopover(posX, posY) {
     const vpRect = viewport.getBoundingClientRect();
     const popW = 320;
-    const popH = 220;
+    const popH = 260;
 
     let x = Math.max(10, Math.min(vpRect.width - popW - 20, posX));
     let y = Math.max(10, Math.min(vpRect.height - popH - 20, posY));
@@ -471,50 +770,7 @@ const Viewer = (() => {
     ocrPopover.style.display = "none";
     selectionBox.style.display = "none";
     lastSelectionBBox300DPI = null;
-  }
-
-  /**
-   * Applies the OCR'd text or parsed value into the active editor row/cell.
-   */
-  function applyOCRField(field) {
-    if (!lastOCRResult) return;
-    const manualText = document.getElementById("ocrExtractedText").value;
-    let val = manualText;
-
-    if (field === "date" && lastOCRResult.parsed_date) {
-      val = lastOCRResult.parsed_date;
-    } else if (field === "amount" && lastOCRResult.parsed_amount !== null) {
-      val = lastOCRResult.parsed_amount;
-    }
-
-    if (window.Editor && typeof window.Editor.updateActiveRowField === "function") {
-      window.Editor.updateActiveRowField(field, val);
-    }
-    hidePopover();
-  }
-
-  /**
-   * Inserts the full OCR'd selection as a new transaction row.
-   */
-  function insertOCRAsNewRow() {
-    if (!lastOCRResult) return;
-    const text = document.getElementById("ocrExtractedText").value;
-    const date = lastOCRResult.parsed_date || "";
-    const amount = lastOCRResult.parsed_amount !== null ? lastOCRResult.parsed_amount : 0.0;
-
-    const newTx = {
-      date: date,
-      description: text,
-      amount: amount,
-      type: amount >= 0 ? "credit" : "debit",
-      page: currentPageIndex + 1,
-      bbox: lastSelectionBBox300DPI
-    };
-
-    if (window.Editor && typeof window.Editor.addNewTransactionRow === "function") {
-      window.Editor.addNewTransactionRow(newTx);
-    }
-    hidePopover();
+    currentSnip = null;
   }
 
   /**
@@ -544,10 +800,11 @@ const Viewer = (() => {
     currentImage = null;
     currentSessionId = null;
     currentPageIndex = 0;
+    currentPageType = "vector";
     currentBBoxes = [];
+    confirmedRowIds.clear();
     activeHoverBox = null;
     activeSelectedRowId = null;
-    lastOCRResult = null;
     lastSelectionBBox300DPI = null;
     isSelecting = false;
     isPanning = false;

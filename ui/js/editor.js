@@ -205,11 +205,12 @@ const Editor = (() => {
           id: t.id,
           bbox: t.bbox,
           date_bbox: t.date_bbox,
+          desc_bbox: t.desc_bbox,
           amount_bbox: t.amount_bbox,
           type: t.type
         }));
 
-      Viewer.loadPage(0, p1.image_url, data.session_id, pageBBoxes);
+      Viewer.loadPage(0, p1.image_url, data.session_id, pageBBoxes, p1.type || "vector");
     }
 
     renderGrid();
@@ -240,11 +241,12 @@ const Editor = (() => {
         id: t.id,
         bbox: t.bbox,
         date_bbox: t.date_bbox,
+        desc_bbox: t.desc_bbox,
         amount_bbox: t.amount_bbox,
         type: t.type
       }));
 
-    Viewer.loadPage(pageIdx, p.image_url, currentStatement.session_id, pageBBoxes);
+    Viewer.loadPage(pageIdx, p.image_url, currentStatement.session_id, pageBBoxes, p.type || "vector");
     renderGrid();
   }
 
@@ -705,6 +707,7 @@ const Editor = (() => {
         id: t.id,
         bbox: t.bbox,
         date_bbox: t.date_bbox,
+        desc_bbox: t.desc_bbox,
         amount_bbox: t.amount_bbox,
         type: t.type
       }));
@@ -1001,13 +1004,137 @@ const Editor = (() => {
       .replace(/'/g, "&#039;");
   }
 
+  // ---------------------------------------------------------------------
+  // Snip-first integration API (called by Viewer)
+  // ---------------------------------------------------------------------
+
+  function getActiveRowIndex() {
+    return activeRowIndex;
+  }
+
+  function resolveRowIndex(rowId) {
+    if (!currentStatement || !rowId) return -1;
+    return currentStatement.transactions.findIndex((t) => t.id === rowId);
+  }
+
+  function getPageType(pageIndex) {
+    if (!currentStatement || !currentStatement.pages || !currentStatement.pages[pageIndex]) return "vector";
+    return currentStatement.pages[pageIndex].type || "vector";
+  }
+
+  /**
+   * Current UI value of one transaction field, for audit old_value reporting.
+   */
+  function peekFieldValue(rowIndex, fieldName) {
+    if (!currentStatement || rowIndex === null || rowIndex === undefined ||
+        rowIndex < 0 || rowIndex >= currentStatement.transactions.length) return "";
+    const v = currentStatement.transactions[rowIndex][fieldName];
+    return (v === null || v === undefined) ? "" : String(v);
+  }
+
+  /**
+   * Writes snip-extracted fields into a transaction row (or creates a new
+   * row when rowIndex is null/out of range). Returns:
+   *   { rowIndex, rowId, changes: [{field_name, old_value, new_value}] }
+   * so the caller can append matching rows to the backend audit trail.
+   */
+  function applySnipFields(rowIndex, fields, meta = {}) {
+    if (!fields || Object.keys(fields).length === 0) return null;
+
+    let idx = (rowIndex !== null && rowIndex !== undefined) ? rowIndex : -1;
+
+    if (!currentStatement) {
+      // Bootstrap an empty manual session shell
+      currentStatement = {
+        session_id: "manual-" + Math.random().toString(36).substr(2, 9),
+        filename: "manual_entry.pdf",
+        page_count: 1,
+        pages: [],
+        opening_balance: 0.0,
+        closing_balance: 0.0,
+        transactions: [],
+        reconciliation: { reconciled: true, opening_balance: 0, closing_balance: 0, total_credits: 0, total_debits: 0, calculated_closing: 0, difference: 0, transaction_count: 0 }
+      };
+      docInfo.style.display = "flex";
+      docFilename.textContent = "manual_entry.pdf";
+      docTypeBadge.textContent = "MANUAL";
+      exportGroup.style.display = "flex";
+    }
+
+    let isNew = false;
+    if (idx < 0 || idx >= currentStatement.transactions.length) {
+      const amt = (fields.amount !== undefined && fields.amount !== null) ? parseFloat(fields.amount) : 0.0;
+      const safeAmt = isNaN(amt) ? 0.0 : amt;
+      const newTx = {
+        id: "tx-" + Math.random().toString(36).substr(2, 8),
+        date: fields.date || new Date().toISOString().split("T")[0],
+        description: fields.description || "New Transaction",
+        amount: Math.abs(safeAmt),
+        type: safeAmt < 0 ? "debit" : "credit",
+        balance: null,
+        page: meta.page || activePageNumber,
+        bbox: meta.bbox || null
+      };
+      currentStatement.transactions.push(newTx);
+      idx = currentStatement.transactions.length - 1;
+      isNew = true;
+    }
+
+    const tx = currentStatement.transactions[idx];
+    const changes = [];
+
+    if (!isNew) {
+      if (fields.date !== undefined && fields.date !== null && fields.date !== tx.date) {
+        changes.push({ field_name: "date", old_value: tx.date || "", new_value: String(fields.date) });
+        tx.date = fields.date;
+      }
+      if (fields.description !== undefined && fields.description !== null &&
+          String(fields.description) !== (tx.description || "")) {
+        changes.push({ field_name: "description", old_value: tx.description || "", new_value: String(fields.description) });
+        tx.description = String(fields.description);
+      }
+      if (fields.amount !== undefined && fields.amount !== null) {
+        const parsed = parseFloat(fields.amount);
+        if (!isNaN(parsed)) {
+          const newAmt = Math.abs(parsed);
+          const newType = parsed < 0 ? "debit" : "credit";
+          const oldAmtStr = (tx.amount === null || tx.amount === undefined) ? "" : String(tx.amount);
+          if (oldAmtStr !== String(newAmt)) {
+            changes.push({ field_name: "amount", old_value: oldAmtStr, new_value: String(newAmt) });
+          }
+          tx.amount = newAmt;
+          tx.type = newType;
+        }
+      }
+    }
+
+    isDirty = true;
+    renderGrid();
+    recalculateReconciliation();
+    updateViewerBBoxes();
+    selectCell(idx, 2);
+
+    if (isNew) {
+      showToast("Added transaction row from snip.", "success");
+    } else if (changes.length > 0) {
+      showToast(`Applied ${changes.length} field(s) to row ${idx + 1}.`, "success");
+    }
+
+    return { rowIndex: idx, rowId: tx.id, changes };
+  }
+
   return {
     init,
     loadStatement,
     selectRowById,
     updateActiveRowField,
     addNewTransactionRow,
-    recalculateReconciliation
+    recalculateReconciliation,
+    getActiveRowIndex,
+    resolveRowIndex,
+    getPageType,
+    peekFieldValue,
+    applySnipFields
   };
 })();
 
